@@ -74,6 +74,7 @@
 #     NOTION_TOKEN=secret_xxx NOTION_DB_ID=abc123... ./personalize.sh
 #
 #   NO_PROMPT=1 ./personalize.sh    # never prompt (for cron/automation)
+#   LIMIT=10 ./personalize.sh       # process only the first 10 leads (testing)
 #   USE_SERVER=0 ./personalize.sh   # disable warm server (cold-boot each lead)
 #   SERVER_PORT=4097 ./personalize.sh   # use a different server port
 ###############################################################################
@@ -90,6 +91,7 @@ FAILED_LOG="${FAILED_LOG:-failed.log}"         # invalid / unparseable JSON
 REVIEW_LOG="${REVIEW_LOG:-review.log}"         # topic == INSUFFICIENT / FETCH_FAILED
 ERR_LOG="${ERR_LOG:-opencode_stderr.log}"      # opencode's own stderr chatter
 SLEEP_SECS="${SLEEP_SECS:-3}"                  # pause between calls
+LIMIT="${LIMIT:-0}"                            # process only first N leads (0 = all). For testing.
 MODEL="${MODEL:-}"                             # optional, e.g. anthropic/claude-sonnet-4
 PYTHON="${PYTHON:-python3}"                     # python interpreter
 FETCH_SCRIPT="${FETCH_SCRIPT:-fetch_article.py}"  # local article fetcher (CLI wrapper)
@@ -208,10 +210,14 @@ if [[ "$IN" == *docs.google.com/spreadsheets* ]]; then
     echo "       Make sure it is shared 'Anyone with the link = Viewer' (or published)." >&2
     exit 1
   fi
-  # A sign-in HTML page (private sheet) won't be CSV — sanity-check the header.
-  if ! head -n 1 "$tmp_csv" | grep -qi 'full_name'; then
-    echo "ERROR: downloaded file doesn't look like the expected CSV (no 'full_name' header)." >&2
-    echo "       The sheet is probably private, or the first row isn't the header." >&2
+  # A private sheet returns an HTML sign-in page instead of CSV — detect that.
+  if head -c 200 "$tmp_csv" | grep -qiE '<!DOCTYPE|<html'; then
+    echo "ERROR: the sheet didn't return CSV (looks like an HTML/sign-in page)." >&2
+    echo "       Make sure it's shared 'Anyone with the link = Viewer' (or published)." >&2
+    exit 1
+  fi
+  if [[ ! -s "$tmp_csv" ]]; then
+    echo "ERROR: the downloaded sheet CSV is empty." >&2
     exit 1
   fi
   IN="$tmp_csv"
@@ -548,6 +554,12 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -z "$line" ]] && continue
   if (( first )); then first=0; continue; fi        # skip header row
   idx=$((idx + 1))
+
+  # Stop early when testing on a subset (LIMIT>0).
+  if (( LIMIT > 0 )) && (( idx > LIMIT )); then
+    echo "Reached LIMIT=$LIMIT lead(s); stopping."
+    break
+  fi
 
   # --- parse the row into named variables -----------------------------------
   mapfile -t f < <(parse_csv_line "$line")
