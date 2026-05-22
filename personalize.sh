@@ -171,6 +171,12 @@ if [[ -t 0 && "${NO_PROMPT:-0}" != "1" ]]; then
   echo
 fi
 
+# Normalize NOTION_DB_ID whether it came from a prompt or an env var: accept a
+# full Notion database URL or a raw id, and reduce it to the bare id.
+if [[ -n "$NOTION_DB_ID" ]]; then
+  NOTION_DB_ID="$(extract_notion_db_id "$NOTION_DB_ID")"
+fi
+
 # Enable Notion only if BOTH a token and a db id ended up set.
 USE_NOTION=0
 [[ -n "$NOTION_TOKEN" && -n "$NOTION_DB_ID" ]] && USE_NOTION=1
