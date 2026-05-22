@@ -550,7 +550,9 @@ echo "-------------------------------------------------------------"
 # ---------------------------------------------------------------------------
 idx=0
 first=1
-while IFS= read -r line || [[ -n "$line" ]]; do
+# Read the CSV on file descriptor 3 (not stdin), so commands inside the loop
+# (notably `opencode`) can't consume the lead list out from under us.
+while IFS= read -r -u 3 line || [[ -n "$line" ]]; do
   [[ -z "$line" ]] && continue
   if (( first )); then first=0; continue; fi        # skip header row
   idx=$((idx + 1))
@@ -613,7 +615,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   [[ -n "$MODEL" ]] && OC_ARGS+=(--model "$MODEL")
   (( USE_SERVER )) && OC_ARGS+=(--attach "$SERVER_URL")
   _t1="$(now_ms)"
-  raw_output="$(opencode "${OC_ARGS[@]}" "$PROMPT" 2>>"$ERR_LOG")"
+  raw_output="$(opencode "${OC_ARGS[@]}" "$PROMPT" </dev/null 2>>"$ERR_LOG")"
   oc_status=$?
   model_ms=$(( $(now_ms) - _t1 ))
 
@@ -682,7 +684,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
 
   echo "  -> OK: first_name='$first_name', topic='$topic'$( (( USE_NOTION )) && printf ' (saved to Notion)') [fetch ${fetch_ms}ms, model ${model_ms}ms]"
   echo "Processed $idx of $TOTAL leads"
-done < "$IN"
+done 3< "$IN"
 
 echo "-------------------------------------------------------------"
 echo "Done. CSV ledger: $OUT$( (( USE_NOTION )) && printf '  |  Notion DB: %s' "$NOTION_DB_ID")"
