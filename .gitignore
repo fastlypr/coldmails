@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated output / run artifacts
+leads_personalized.csv
+*.log
+
+# Secrets / environment (Notion token is entered at runtime, never commit it)
+.env
+*.env
+secrets*
+
+# Editor / OS cruft
+.DS_Store
+.vscode/
+.idea/
