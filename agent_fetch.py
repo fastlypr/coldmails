@@ -13,7 +13,17 @@ import re
 from html.parser import HTMLParser
 from urllib.request import Request, urlopen
 
-from http_utils import SSL_CONTEXT
+try:
+    from http_utils import SSL_CONTEXT
+except ImportError:
+    # http_utils lives in the aienrich project. When running standalone (this
+    # repo), fall back to an SSL context that skips certificate verification
+    # (matches the original behavior — needed because some hosts / Python
+    # installs lack a usable local CA bundle). Fine for reading public articles.
+    import ssl
+    SSL_CONTEXT = ssl.create_default_context()
+    SSL_CONTEXT.check_hostname = False
+    SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 
 USER_AGENT = (
