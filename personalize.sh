@@ -12,9 +12,9 @@
 # For EACH lead (one at a time, sequentially):
 #   1. Fetches + cleans the article LOCALLY via fetch_article.py (a wrapper
 #      around the provided agent_fetch.py).
-#   2. Calls the opencode CLI, triggering the skill via its slash command
-#      "/personalize-cold-email" with the lead data + cleaned article_content
-#      right after it (one message).
+#   2. Calls the NVIDIA API via personalize_llm.py — the skill text
+#      (personalize-cold-email.skill.md) is the system prompt, the lead data is
+#      the user message, and the cleaned article_content is piped in on stdin.
 #   3. Validates the returned JSON, then saves the lead (original columns +
 #      first_name + topic) to the output sink(s):
 #        - always to a local CSV (this is the resume ledger + audit trail), and
@@ -37,10 +37,11 @@
 #   - Progress printout
 #
 # Requirements (pre-installed on the Ubuntu VM):
-#   - opencode  (with the "personalize-cold-email" skill installed)
+#   - python3 + the 'openai' pip package  (runs fetch_article.py and the NVIDIA
+#               caller personalize_llm.py).  Install:  pip install openai
+#   - NVIDIA_API_KEY env var  (export your nvapi-... key before running)
 #   - jq        (JSON parsing + building Notion request bodies)
 #   - gawk      (robust CSV field parsing via FPAT; Ubuntu's default mawk lacks it)
-#   - python3   (runs fetch_article.py -> agent_fetch.py)
 #   - curl      (Google Sheet download + Notion API)
 #               install with:  sudo apt-get install -y gawk jq python3 curl
 #
@@ -80,7 +81,22 @@
 ###############################################################################
 
 set -uo pipefail   # -e is intentionally OFF: we expect some commands (jq checks,
-                   # opencode calls) to fail per-lead and we handle that ourselves.
+                   # model calls) to fail per-lead and we handle that ourselves.
+
+# ---------------------------------------------------------------------------
+# Load local secrets/settings from a .env file (gitignored) if present, so you
+# don't have to export NVIDIA_API_KEY (etc.) by hand every session. Looked up
+# next to this script; override the path with ENV_FILE=/path/to/.env
+# ---------------------------------------------------------------------------
+_self_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENV_FILE="${ENV_FILE:-$_self_dir/.env}"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a                       # export every var defined while sourcing
+  # shellcheck disable=SC1090
+  . "$ENV_FILE"
+  set +a
+  echo "Loaded settings from $ENV_FILE"
+fi
 
 # ---------------------------------------------------------------------------
 # Config — override any of these by setting them in the environment.
@@ -95,11 +111,17 @@ LIMIT="${LIMIT:-0}"                            # process only first N leads (0 =
 MODEL="${MODEL:-}"                             # optional, e.g. anthropic/claude-sonnet-4
 PYTHON="${PYTHON:-python3}"                     # python interpreter
 FETCH_SCRIPT="${FETCH_SCRIPT:-fetch_article.py}"  # local article fetcher (CLI wrapper)
+LLM_SCRIPT="${LLM_SCRIPT:-personalize_llm.py}"    # NVIDIA caller (skill = system prompt)
+
+# --- NVIDIA model (replaces opencode) — OpenAI-compatible hosted endpoint ----
+NVIDIA_API_KEY="${NVIDIA_API_KEY:-}"           # REQUIRED: export your nvapi-... key
+NVIDIA_MODEL="${NVIDIA_MODEL:-nvidia/nemotron-3-ultra-550b-a55b}"
+SKILL_FILE="${SKILL_FILE:-personalize-cold-email.skill.md}"  # system prompt for the model
 
 # --- Server mode (speed) — keep ONE opencode runtime warm and attach each call.
 # Avoids re-booting opencode for every lead. Each call still gets a fresh
 # session (no context bleed); only the cold-start is amortized to once.
-USE_SERVER="${USE_SERVER:-1}"                  # 1 = start/attach a warm server
+USE_SERVER="${USE_SERVER:-0}"                  # opencode-only warm server; OFF in NVIDIA mode
 SERVER_HOST="${SERVER_HOST:-127.0.0.1}"        # opencode serve --hostname
 SERVER_PORT="${SERVER_PORT:-4096}"             # opencode serve --port
 SERVER_URL="http://${SERVER_HOST}:${SERVER_PORT}"
@@ -144,9 +166,8 @@ if [[ -t 0 && "${NO_PROMPT:-0}" != "1" ]]; then
   read -r -p "Leads source — Google Sheet URL or CSV path [${IN}]: " _in
   [[ -n "${_in:-}" ]] && IN="$_in"
 
-  # Model: type a provider/model id to override, or leave blank to use the
-  # model you've selected inside opencode (its /models default).
-  read -r -p "Model id (provider/model) — blank = opencode's selected default [${MODEL:-opencode default}]: " _model
+  # NVIDIA model id to use; blank keeps the default (NVIDIA_MODEL).
+  read -r -p "NVIDIA model id — blank = default [${MODEL:-$NVIDIA_MODEL}]: " _model
   [[ -n "${_model:-}" ]] && MODEL="$_model"
 
   # Notion token (optional). Hidden input so it isn't shown on screen.
@@ -187,12 +208,31 @@ OUT_HEADER="full_name,article_url,role,company,linkedin,email,revenue,status,fir
 # ---------------------------------------------------------------------------
 # Dependency check
 # ---------------------------------------------------------------------------
-for cmd in opencode jq gawk curl "$PYTHON"; do
+for cmd in jq gawk curl "$PYTHON"; do
   if ! command -v "$cmd" >/dev/null 2>&1; then
     echo "ERROR: required command '$cmd' not found in PATH." >&2
     exit 1
   fi
 done
+
+# --- NVIDIA model setup ----------------------------------------------------
+# A model id from env or the prompt (MODEL) overrides the default NVIDIA_MODEL.
+[[ -n "$MODEL" ]] && NVIDIA_MODEL="$MODEL"
+if [[ -z "$NVIDIA_API_KEY" ]]; then
+  echo "ERROR: NVIDIA_API_KEY is not set. Export your key first, e.g.:" >&2
+  echo "       export NVIDIA_API_KEY='nvapi-...'" >&2
+  exit 1
+fi
+if [[ ! -f "$LLM_SCRIPT" ]]; then
+  echo "ERROR: NVIDIA caller '$LLM_SCRIPT' not found." >&2
+  exit 1
+fi
+if [[ ! -f "$SKILL_FILE" ]]; then
+  echo "ERROR: skill/system-prompt file '$SKILL_FILE' not found." >&2
+  exit 1
+fi
+# personalize_llm.py reads these from the environment.
+export NVIDIA_API_KEY NVIDIA_MODEL SKILL_FILE
 
 # ---------------------------------------------------------------------------
 # If IN is a PUBLIC Google Sheet URL, download it as CSV to a temp file.
@@ -547,8 +587,7 @@ if (( USE_SERVER )); then
 fi
 
 echo "Starting. $TOTAL leads in '$IN'. Already done: ${#DONE[@]}."
-echo "Model: ${MODEL:-<opencode selected default>}"
-echo "Server mode: $( (( USE_SERVER )) && echo "ON ($SERVER_URL)" || echo "OFF (per-call boot)")"
+echo "Model: $NVIDIA_MODEL  (provider: NVIDIA OpenAI-compatible API)"
 echo "-------------------------------------------------------------"
 
 # ---------------------------------------------------------------------------
@@ -609,28 +648,25 @@ while IFS= read -r -u 3 line || [[ -n "$line" ]]; do
     continue
   fi
 
-  # --- build the prompt for the skill ---------------------------------------
-  # Trigger the skill via its slash command, with the lead data right after it
-  # (same message), exactly as you'd type it by hand in opencode.
-  PROMPT="$(printf '/personalize-cold-email\n\nfull_name: %s\narticle_url: %s\nlinkedin: %s\nemail: %s\narticle_content: %s\n' \
-            "$full_name" "$article_url" "$linkedin" "$email" "$article_content")"
-
-  # --- call opencode (waits here until it replies) --------------------------
-  # Server mode: --attach reuses the warm runtime; still a fresh session per lead.
-  OC_ARGS=(run)
-  [[ -n "$MODEL" ]] && OC_ARGS+=(--model "$MODEL")
-  (( USE_SERVER )) && OC_ARGS+=(--attach "$SERVER_URL")
+  # --- call the NVIDIA model (waits here until it replies) -------------------
+  # The skill text is the system prompt (personalize_llm.py reads $SKILL_FILE);
+  # the lead fields are passed as args and the cleaned article text is piped in
+  # on stdin (avoids ARG_MAX limits on big articles). stdout = the JSON reply.
   _t1="$(now_ms)"
-  raw_output="$(opencode "${OC_ARGS[@]}" "$PROMPT" </dev/null 2>>"$ERR_LOG")"
+  raw_output="$(printf '%s' "$article_content" | "$PYTHON" "$LLM_SCRIPT" \
+                  --full_name "$full_name" \
+                  --article_url "$article_url" \
+                  --linkedin "$linkedin" \
+                  --email "$email" 2>>"$ERR_LOG")"
   oc_status=$?
   model_ms=$(( $(now_ms) - _t1 ))
 
-  # Pause between calls (counts as "between calls" regardless of outcome).
+  # Pause between calls (rate-limit friendliness), regardless of outcome.
   sleep "$SLEEP_SECS"
 
   if (( oc_status != 0 )); then
-    echo "  -> opencode exited with status $oc_status; logged to $FAILED_LOG"
-    printf '%s | %s | opencode_exit=%s\n' "$(ts)" "$email" "$oc_status" >> "$FAILED_LOG"
+    echo "  -> model call failed (exit $oc_status); logged to $FAILED_LOG"
+    printf '%s | %s | llm_exit=%s\n' "$(ts)" "$email" "$oc_status" >> "$FAILED_LOG"
     continue
   fi
 
