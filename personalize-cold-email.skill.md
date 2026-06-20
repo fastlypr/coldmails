@@ -77,22 +77,37 @@ So `topic` must:
 
 ## STEP 3: EXTRACT `topic` (the core)
 
-### Preference ladder — pick the highest tier that is TRUE and traceable
+### First, find the named asset
+Before anything else, scan the article for the ONE thing this person built, runs,
+founded, wrote, or leads — their company, product, fund, book, show, methodology,
+or named procedure. That name is almost always the correct anchor for `topic`.
 
-- **A1 — Named asset (strongest).** A company, product, book, fund, show,
-  methodology, or named procedure the person built, runs, or is known for, by its
-  real name. Proper nouns are the hardest thing to fake.
+### Tier gate — use the HIGHEST tier that exists, not your favorite phrase
+
+- **A1 — Named asset.** If the person built/runs a NAMED company, product, book,
+  or method that appears in the article, `topic` **must** be built around that
+  name. Do not skip A1 for a catchier abstract phrase.
   *e.g.* `the Asher House animal sanctuary` · `the Stellate Ganglion Block procedure`
-- **A2 — Hard number.** A specific quantified result tied to them: revenue, raise,
-  valuation, users, units, people served, locations, ranking, years. Numbers are
-  the #1 pattern-interrupt in a cold inbox.
+- **A2 — Hard number tied to THEM.** Revenue, raise, valuation, users, people
+  served, locations, ranking, years. Use only when there is no A1. Macro/industry
+  stats the person merely *cites* (e.g. "$4.4M average breach cost", "99.9% of
+  businesses") are **not** A2 — they are not the person's own result.
   *e.g.* `scaling past $1M in revenue` · `supporting 5,000 students`
-- **A3 — Signature position.** A specific stance, reframing, or niche the article
-  explicitly names them for.
+- **A3 — Signature position.** A specific stance or reframing. Use **only** when
+  the article names no asset (A1) and no personal number (A2). Even then, tie it
+  to what they *do*, not a free-floating concept.
   *e.g.* `your push to reclassify PTSD as a brain injury`
 
-**Combine when natural** — a name + a number is the strongest of all:
+**Combine when natural** — name + number is strongest:
 `scaling Quasar Markets into an all-in-one AI finance platform`.
+
+### Hard rule: the topic must contain a proper noun or a number
+If the article gives you a name the person built/runs, or a number tied to them,
+`topic` MUST include it. A topic with **neither** — an abstract concept like
+`the too-small-to-target mindset` or `the future of work` — is allowed ONLY when
+the article truly has no named asset and no personal number. If you are about to
+output an abstract phrase while a named asset exists, STOP and rewrite around the
+named asset.
 
 If the article has none of A1/A2/A3 for this person (pure opinion piece, person
 mentioned only in passing, or no usable content), set `topic` = `"INSUFFICIENT"`.
@@ -138,6 +153,7 @@ Skipping beats shipping a generic line that screams "mass blast."
 | A doctor's signature procedure | `the Stellate Ganglion Block procedure` | A1 |
 | A founder who crossed $1M | `scaling [Company] past $1M in revenue` | A1+A2 |
 | A vision piece, no numbers | `building Quasar Markets into an all-in-one AI finance platform` | A1 |
+| Founder of a named IT firm (+ a catchy "mindset" phrase in the article) | ✅ `building Reperio to cut tech friction for small businesses` — NOT ❌ `the too-small-to-target mindset` | A1 beats A3 |
 | A PTSD-reframing advocate | `your push to reclassify PTSD as a brain injury` | A3 |
 
 ---
@@ -153,9 +169,9 @@ Skipping beats shipping a generic line that screams "mass blast."
 
 ## RULES FOR `role`
 
-A single role title, 1–3 words, from how the article describes this person:
-founder, CEO, investor, coach, advisor, wealth manager, consultant, author,
-physician, surgeon, anesthesiologist, researcher, etc.
+A single role title, 1–3 words, from how the article describes this person.
+Pick ONE — `founder`, not `founder CEO`. Examples: founder, CEO, investor, coach,
+advisor, wealth manager, consultant, author, physician, surgeon, researcher.
 
 ## DISAMBIGUATION
 

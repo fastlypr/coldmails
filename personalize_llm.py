@@ -30,8 +30,10 @@ Environment:
   SKILL_FILE       default <script dir>/personalize-cold-email.skill.md
   LLM_TEMPERATURE  default 0.6   (lower = more consistent JSON)
   LLM_TOP_P        default 0.95
-  LLM_MAX_TOKENS   default 16384 (also used as the reasoning budget)
+  LLM_MAX_TOKENS   default 16384 (also used as the reasoning budget on Nemotron)
   LLM_TIMEOUT      default 600   (seconds)
+  LLM_REASONING_EFFORT  gpt-oss only: low|medium|high   (default high)
+  LLM_EXTRA_BODY        advanced: raw JSON that overrides the per-model params
   DEBUG_REASONING  if "1", stream the model's thinking to STDERR
 
 Exit codes:
@@ -41,6 +43,7 @@ Exit codes:
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -112,6 +115,26 @@ def main():
 
     client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
 
+    # Reasoning controls differ by model family. Nemotron uses an explicit
+    # thinking toggle + budget; gpt-oss uses a reasoning_effort level. Other
+    # models get a plain call. LLM_EXTRA_BODY (raw JSON) overrides all of this.
+    model_lc = model.lower()
+    extra_body = {}
+    if "nemotron" in model_lc:
+        if os.environ.get("LLM_THINKING", "1") == "1":
+            extra_body = {
+                "chat_template_kwargs": {"enable_thinking": True},
+                "reasoning_budget": max_tokens,
+            }
+    elif "gpt-oss" in model_lc:
+        extra_body = {"reasoning_effort": os.environ.get("LLM_REASONING_EFFORT", "high")}
+    override = (os.environ.get("LLM_EXTRA_BODY") or "").strip()
+    if override:
+        try:
+            extra_body = json.loads(override)
+        except json.JSONDecodeError:
+            die("LLM_EXTRA_BODY is not valid JSON.", 2)
+
     try:
         completion = client.chat.completions.create(
             model=model,
@@ -122,10 +145,7 @@ def main():
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            extra_body={
-                "chat_template_kwargs": {"enable_thinking": True},
-                "reasoning_budget": max_tokens,
-            },
+            extra_body=extra_body,
             stream=True,
         )
     except Exception as exc:  # noqa: BLE001 — surface any API/client error cleanly
