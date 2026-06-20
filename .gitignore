@@ -9,7 +9,7 @@ leads_personalized.csv
 # Lead lists & enriched outputs — contain real emails (PII); never commit these.
 # Add your own lead-file names/patterns here too.
 *personalized*.csv
-gsheet_leads.csv
+gsheet*.csv
 test_*.csv
 USA TODAY*.csv
 
