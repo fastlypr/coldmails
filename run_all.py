@@ -1,46 +1,60 @@
 #!/usr/bin/env python3
 """
-run_all.py — fast, rate-limited batch cold-email personalizer.
+run_all.py — fast, rate-limited batch cold-email personalizer (in-place).
 
-Reads a leads CSV, then fetches each article and calls the model CONCURRENTLY
-(a thread pool) while globally capping model requests to NVIDIA's rate limit
-(default 38/min, just under the 40 limit for headroom). Writes ONE enriched CSV:
-every original column PLUS first_name and topic.
+Input can be EITHER:
+  - a local CSV path, OR
+  - a PUBLIC Google Sheet URL (shared "Anyone with the link = Viewer"); it is
+    downloaded as CSV.
 
-Why this is fast: the old bash loop was sequential (~10 leads/min). Here, many
-articles are fetched in parallel and the only thing rate-limited is the model
-call, so throughput rises to ~the RPM cap. 249 leads ≈ 7 minutes instead of ~25.
+It fetches each article and calls the model CONCURRENTLY (a thread pool) while
+globally capping model requests to NVIDIA's rate limit (default 38/min, just
+under the 40 cap). Then it writes results back into ONE CSV, IN PLACE:
 
-Resumable: skips any lead whose email is already in the output CSV, so you can
-re-run to pick up failures (Ctrl-C safe — rows are flushed as they finish).
+  - For a local CSV  -> the same file you passed.
+  - For a Google Sheet -> the downloaded CSV (OUT, default gsheet_leads.csv).
+
+Data safety (by request):
+  - Existing columns and values are preserved untouched; only `first_name` and
+    `topic` are added/filled.
+  - It NEVER adds duplicate columns — if first_name/topic already exist (any
+    capitalisation) they are reused.
+  - Writes are ATOMIC (temp file + os.replace), so the CSV is never left
+    half-written if the run is interrupted.
+  - Resumable: a row whose `topic` is already filled is skipped, so re-running
+    only processes new/empty rows (and picks up new rows added to the sheet).
 
 Usage:
-  python3 run_all.py "USA TODAY - EMAILS - JUN 12 - Safe emails.csv"
+  python3 run_all.py "leads.csv"
+  python3 run_all.py "https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0"
 
-Env (all optional; NVIDIA_* are loaded from .env automatically):
-  OUT          output CSV (default: <input> with "_personalized" before .csv)
+Env (optional; NVIDIA_* loaded from .env automatically):
+  OUT          target CSV for the Google-Sheet case (default gsheet_leads.csv).
+               For a local CSV this is ignored — it always writes in place.
   RPM          max model requests per minute (default 38)
   CONCURRENCY  worker threads (default 8)
-  LIMIT        process only the first N leads (0 = all; for testing)
-  REVIEW_LOG   default review.log   (INSUFFICIENT / FETCH_FAILED / no url)
-  FAILED_LOG   default failed.log   (model/JSON errors)
-  Plus every personalize_llm.py var (NVIDIA_MODEL, LLM_REASONING_EFFORT, ...).
+  LIMIT        process only the first N pending leads (0 = all; for testing)
+  CHECKPOINT   flush the CSV every N finished leads (default 20)
+  REVIEW_LOG / FAILED_LOG  log paths (default review.log / failed.log)
 """
 
 import csv
+import io
 import json
 import os
+import re
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PY = sys.executable
 
 
-# --- load .env (so NVIDIA_API_KEY etc. are available to child processes) ------
 def load_dotenv(path):
     if not os.path.isfile(path):
         return
@@ -53,8 +67,9 @@ def load_dotenv(path):
             os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
 
 
-# --- global rate limiter: spaces out model calls to <= RPM per minute ---------
 class RateLimiter:
+    """Spaces out model calls to <= rpm per minute, across all worker threads."""
+
     def __init__(self, rpm):
         self.interval = 60.0 / max(rpm, 1)
         self.lock = threading.Lock()
@@ -69,7 +84,6 @@ class RateLimiter:
             self.next_t = now + self.interval
 
 
-# --- pull the first balanced {...} object out of arbitrary model output -------
 def extract_json(text):
     depth = 0
     start = None
@@ -106,157 +120,206 @@ def pick_col(fieldnames, candidates):
     return None
 
 
-def process_lead(row, cols, limiter, timeout):
-    """Returns (status, email, note, enriched_row). status in ok/review/failed."""
-    full_name = (row.get(cols["name"]) or "").strip()
-    article_url = (row.get(cols["article"]) or "").strip()
-    linkedin = (row.get(cols["linkedin"]) or "").strip() if cols["linkedin"] else ""
-    email = (row.get(cols["email"]) or "").strip() if cols["email"] else ""
+def is_gsheet(s):
+    return "docs.google.com/spreadsheets" in s
 
-    out = dict(row)
-    out["first_name"] = ""
-    out["topic"] = ""
 
+def download_gsheet(url):
+    """Download a public Google Sheet as CSV text. Raises on private/parse error."""
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]{20,})", url)
+    if not m:
+        raise ValueError("could not parse a Google Sheet id from the URL")
+    sheet_id = m.group(1)
+    g = re.search(r"[?#&]gid=(\d+)", url)
+    export = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv"
+    if g:
+        export += f"&gid={g.group(1)}"
+    req = urllib.request.Request(export, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = resp.read()
+    except Exception:
+        # Some environments need an unverified SSL context as a fallback.
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, context=ctx, timeout=60) as resp:
+            data = resp.read()
+    head = data[:200].lstrip().lower()
+    if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+        raise ValueError("the sheet returned HTML, not CSV — share it 'Anyone with the link = Viewer'")
+    return data.decode("utf-8-sig")
+
+
+def write_atomic(target_path, fieldnames, rows):
+    """Write the whole table to target_path atomically (temp file + replace)."""
+    tmp = f"{target_path}.tmp.{os.getpid()}"
+    with open(tmp, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, target_path)
+
+
+def process_lead(idx, full_name, article_url, linkedin, email, limiter, timeout):
+    """Worker: fetch + model. Returns (idx, status, email, note, first_name, topic)."""
     if not article_url:
-        return ("review", email, "no_article_url", out)
+        return (idx, "review", email, "no_article_url", "", "")
 
-    # 1) fetch the article (not rate-limited — it's not an NVIDIA request)
     try:
         fetch = subprocess.run(
             [PY, os.path.join(SCRIPT_DIR, "fetch_article.py"), article_url],
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return ("review", email, "FETCH_FAILED(timeout)", out)
+        return (idx, "review", email, "FETCH_FAILED(timeout)", "", "")
     if fetch.returncode != 0 or len(fetch.stdout.strip()) < 1:
-        return ("review", email, f"FETCH_FAILED(exit={fetch.returncode})", out)
-    article_content = fetch.stdout
+        return (idx, "review", email, f"FETCH_FAILED(exit={fetch.returncode})", "", "")
 
-    # 2) model call — gated by the global rate limiter
     limiter.wait()
     try:
         model = subprocess.run(
             [PY, os.path.join(SCRIPT_DIR, "personalize_llm.py"),
              "--full_name", full_name, "--article_url", article_url,
              "--linkedin", linkedin, "--email", email],
-            input=article_content, capture_output=True, text=True, timeout=timeout,
+            input=fetch.stdout, capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return ("failed", email, "llm_timeout", out)
+        return (idx, "failed", email, "llm_timeout", "", "")
     if model.returncode != 0:
-        return ("failed", email, f"llm_exit={model.returncode}: {model.stderr.strip()[:160]}", out)
+        return (idx, "failed", email, f"llm_exit={model.returncode}: {model.stderr.strip()[:160]}", "", "")
 
     js = extract_json(model.stdout)
     if not js:
-        return ("failed", email, "no_json_in_output", out)
+        return (idx, "failed", email, "no_json_in_output", "", "")
     try:
         data = json.loads(js)
     except json.JSONDecodeError as exc:
-        return ("failed", email, f"bad_json: {exc}", out)
+        return (idx, "failed", email, f"bad_json: {exc}", "", "")
 
     topic = (data.get("topic") or "").strip()
-    out["first_name"] = (data.get("first_name") or "").strip()
-    out["topic"] = topic
+    first_name = (data.get("first_name") or "").strip()
     if topic in ("", "INSUFFICIENT", "FETCH_FAILED"):
-        out["topic"] = topic or "INSUFFICIENT"
-        return ("review", email, out["topic"], out)
-    return ("ok", email, "", out)
+        return (idx, "review", email, topic or "INSUFFICIENT", first_name, topic or "INSUFFICIENT")
+    return (idx, "ok", email, "", first_name, topic)
 
 
 def main():
     load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
-    os.environ.setdefault("LLM_TIMEOUT", "120")  # keep a stuck call from holding a worker forever
+    os.environ.setdefault("LLM_TIMEOUT", "120")
 
     if len(sys.argv) != 2:
-        sys.stderr.write('usage: run_all.py "<leads.csv>"\n')
+        sys.stderr.write('usage: run_all.py "<leads.csv | google-sheet-url>"\n')
         return 64
-    in_path = sys.argv[1]
-    if not os.path.isfile(in_path):
-        sys.stderr.write(f"input file not found: {in_path}\n")
-        return 1
+    in_arg = sys.argv[1]
 
     rpm = float(os.environ.get("RPM", "38"))
     concurrency = int(os.environ.get("CONCURRENCY", "8"))
     limit = int(os.environ.get("LIMIT", "0"))
+    checkpoint_every = int(os.environ.get("CHECKPOINT", "20"))
     review_log = os.environ.get("REVIEW_LOG", "review.log")
     failed_log = os.environ.get("FAILED_LOG", "failed.log")
-    base, ext = os.path.splitext(in_path)
-    out_path = os.environ.get("OUT", f"{base}_personalized{ext or '.csv'}")
     timeout = float(os.environ.get("LLM_TIMEOUT", "120")) + 30
 
-    # --- read input (utf-8-sig strips any BOM from a Google Sheets export) ----
-    with open(in_path, newline="", encoding="utf-8-sig") as fh:
-        reader = csv.DictReader(fh)
-        in_fields = reader.fieldnames or []
+    # --- read the source rows + decide the in-place target file ---------------
+    if is_gsheet(in_arg):
+        print(f"Downloading public Google Sheet...")
+        try:
+            text = download_gsheet(in_arg)
+        except Exception as exc:
+            sys.stderr.write(f"sheet download failed: {exc}\n")
+            return 1
+        reader = csv.DictReader(io.StringIO(text))
+        source_fields = list(reader.fieldnames or [])
         rows = list(reader)
+        target_path = os.environ.get("OUT", "gsheet_leads.csv")
+    else:
+        if not os.path.isfile(in_arg):
+            sys.stderr.write(f"input file not found: {in_arg}\n")
+            return 1
+        with open(in_arg, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.DictReader(fh)
+            source_fields = list(reader.fieldnames or [])
+            rows = list(reader)
+        target_path = in_arg  # write in place
 
-    cols = {
-        "name": pick_col(in_fields, ["full_name", "Name", "name", "Full Name"]),
-        "article": pick_col(in_fields, ["article_url", "article", "Article", "url", "URL"]),
-        "linkedin": pick_col(in_fields, ["linkedin", "LinkedIn", "linkedin_url", "LinkedIn URL"]),
-        "email": pick_col(in_fields, ["email", "Email", "email_address", "Email Address"]),
-    }
-    if not cols["name"] or not cols["article"]:
-        sys.stderr.write(f"could not find name/article columns in header: {in_fields}\n")
+    if not source_fields:
+        sys.stderr.write("no columns found in the input.\n")
         return 1
 
-    out_fields = list(in_fields) + [c for c in ("first_name", "topic") if c not in in_fields]
+    name_col = pick_col(source_fields, ["full_name", "Name", "name", "Full Name"])
+    article_col = pick_col(source_fields, ["article_url", "article", "Article", "url", "URL"])
+    linkedin_col = pick_col(source_fields, ["linkedin", "LinkedIn", "linkedin_url"])
+    email_col = pick_col(source_fields, ["email", "Email", "email_address", "Email Address"])
+    if not name_col or not article_col:
+        sys.stderr.write(f"could not find name/article columns in: {source_fields}\n")
+        return 1
 
-    # --- resume: skip emails already written to OUT ---------------------------
-    done = set()
-    out_exists = os.path.isfile(out_path)
-    if out_exists and cols["email"]:
-        with open(out_path, newline="", encoding="utf-8-sig") as fh:
+    # Reuse existing first_name/topic columns (any case) — never duplicate them.
+    fn_col = pick_col(source_fields, ["first_name", "First Name", "firstname"]) or "first_name"
+    tp_col = pick_col(source_fields, ["topic", "Topic"]) or "topic"
+    out_fields = list(source_fields)
+    for c in (fn_col, tp_col):
+        if c not in out_fields:
+            out_fields.append(c)
+
+    # For a Google Sheet, carry over any results already saved in the target
+    # file (so re-downloading the sheet doesn't lose prior work).
+    if is_gsheet(in_arg) and os.path.isfile(target_path) and email_col:
+        prior = {}
+        with open(target_path, newline="", encoding="utf-8-sig") as fh:
             for r in csv.DictReader(fh):
-                e = (r.get(cols["email"]) or "").strip()
+                e = (r.get(email_col) or "").strip()
                 if e:
-                    done.add(e)
+                    prior[e] = (r.get(fn_col, ""), r.get(tp_col, ""))
+        for row in rows:
+            e = (row.get(email_col) or "").strip()
+            if e in prior and prior[e][1].strip() and not (row.get(tp_col) or "").strip():
+                row[fn_col], row[tp_col] = prior[e]
 
+    # Ensure every row has the two keys, and build the to-do list (empty topic).
     todo = []
-    for r in rows:
-        if limit and len(todo) >= limit:
-            break
-        e = (r.get(cols["email"]) or "").strip() if cols["email"] else ""
-        if e and e in done:
+    already = 0
+    for idx, row in enumerate(rows):
+        row.setdefault(fn_col, row.get(fn_col, ""))
+        row.setdefault(tp_col, row.get(tp_col, ""))
+        if (row.get(tp_col) or "").strip():
+            already += 1
             continue
-        todo.append(r)
+        if limit and len(todo) >= limit:
+            continue
+        todo.append((idx, (row.get(name_col) or "").strip(),
+                     (row.get(article_col) or "").strip(),
+                     (row.get(linkedin_col) or "").strip() if linkedin_col else "",
+                     (row.get(email_col) or "").strip() if email_col else ""))
 
     total = len(todo)
-    print(f"Input: {in_path}  ({len(rows)} rows, {len(done)} already done)")
-    print(f"Output: {out_path}")
+    print(f"Source: {in_arg}")
+    print(f"Saving in place to: {target_path}  ({len(rows)} rows, {already} already done)")
     print(f"Model: {os.environ.get('NVIDIA_MODEL', '<default>')}  |  RPM cap: {rpm:g}  |  workers: {concurrency}")
     print(f"Processing {total} leads...")
     print("-" * 60)
     if total == 0:
-        print("Nothing to do.")
+        write_atomic(target_path, out_fields, rows)  # still normalise columns once
+        print("Nothing to do (all rows already have a topic).")
         return 0
 
     limiter = RateLimiter(rpm)
-    write_lock = threading.Lock()
-    out_fh = open(out_path, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_fh, fieldnames=out_fields, extrasaction="ignore")
-    if not out_exists:
-        writer.writeheader()
-        out_fh.flush()
-
     counts = {"ok": 0, "review": 0, "failed": 0}
     started = time.monotonic()
     n_done = 0
+    lock = threading.Lock()
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(process_lead, r, cols, limiter, timeout) for r in todo]
+        futures = [pool.submit(process_lead, *t, limiter, timeout) for t in todo]
         for fut in as_completed(futures):
-            status, email, note, out_row = fut.result()
-            with write_lock:
+            idx, status, email, note, first_name, topic = fut.result()
+            with lock:
                 n_done += 1
                 counts[status] += 1
+                rows[idx][fn_col] = first_name
+                rows[idx][tp_col] = topic
                 if status == "ok":
-                    writer.writerow(out_row)
-                    out_fh.flush()
-                    print(f"[{n_done}/{total}] OK    {email}  ->  {out_row['topic']}")
+                    print(f"[{n_done}/{total}] OK    {email}  ->  {topic}")
                 elif status == "review":
-                    writer.writerow(out_row)  # keep the row (topic=INSUFFICIENT) so it isn't retried forever
-                    out_fh.flush()
                     with open(review_log, "a", encoding="utf-8") as lf:
                         lf.write(f"{email} | {note}\n")
                     print(f"[{n_done}/{total}] SKIP  {email}  ({note})")
@@ -264,16 +327,18 @@ def main():
                     with open(failed_log, "a", encoding="utf-8") as lf:
                         lf.write(f"{email} | {note}\n")
                     print(f"[{n_done}/{total}] FAIL  {email}  ({note})")
+                if n_done % checkpoint_every == 0:
+                    write_atomic(target_path, out_fields, rows)
 
-    out_fh.close()
+    write_atomic(target_path, out_fields, rows)
     elapsed = time.monotonic() - started
     rate = (n_done / elapsed * 60) if elapsed else 0
     print("-" * 60)
     print(f"Done in {elapsed/60:.1f} min  ({rate:.0f} leads/min).")
     print(f"  ok={counts['ok']}  review={counts['review']}  failed={counts['failed']}")
-    print(f"  enriched CSV: {out_path}")
+    print(f"  saved in place: {target_path}")
     if counts["failed"]:
-        print(f"  re-run the same command to retry the {counts['failed']} failed lead(s) (resume skips finished ones).")
+        print(f"  re-run the same command to retry the {counts['failed']} failed lead(s).")
     return 0
 
 
