@@ -206,10 +206,12 @@ def main():
     load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
     os.environ.setdefault("LLM_TIMEOUT", "120")
 
-    if len(sys.argv) != 2:
-        sys.stderr.write('usage: run_all.py "<leads.csv | google-sheet-url>"\n')
+    # Input can be passed as an argument OR set as IN in .env (e.g. a Sheet URL),
+    # which keeps the run/background command short.
+    in_arg = sys.argv[1] if len(sys.argv) >= 2 else os.environ.get("IN", "").strip()
+    if not in_arg:
+        sys.stderr.write('usage: run_all.py "<leads.csv | google-sheet-url>"   (or set IN in .env)\n')
         return 64
-    in_arg = sys.argv[1]
 
     rpm = float(os.environ.get("RPM", "38"))
     concurrency = int(os.environ.get("CONCURRENCY", "8"))
