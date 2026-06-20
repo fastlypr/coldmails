@@ -6,6 +6,13 @@ __pycache__/
 leads_personalized.csv
 *.log
 
+# Lead lists & enriched outputs — contain real emails (PII); never commit these.
+# Add your own lead-file names/patterns here too.
+*personalized*.csv
+gsheet_leads.csv
+test_*.csv
+USA TODAY*.csv
+
 # Secrets / environment (Notion token is entered at runtime, never commit it)
 .env
 *.env
