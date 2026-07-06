@@ -151,6 +151,9 @@ def download_gsheet(url):
 
 def write_atomic(target_path, fieldnames, rows):
     """Write the whole table to target_path atomically (temp file + replace)."""
+    parent = os.path.dirname(target_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)  # auto-create e.g. results/
     tmp = f"{target_path}.tmp.{os.getpid()}"
     with open(tmp, "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
@@ -241,7 +244,7 @@ def main():
             reader = csv.DictReader(fh)
             source_fields = list(reader.fieldnames or [])
             rows = list(reader)
-        target_path = in_arg  # write in place
+        target_path = os.environ.get("OUT", in_arg)  # OUT overrides; else write in place
 
     if not source_fields:
         sys.stderr.write("no columns found in the input.\n")
