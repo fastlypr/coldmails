@@ -115,6 +115,25 @@ def extract_json(text):
     return ""
 
 
+def clean_text(s):
+    """Force plain, clean text: drop trademark/registered/copyright marks,
+    straighten curly quotes/dashes, collapse odd whitespace. Models sometimes
+    copy these straight out of the article (e.g. 'Sites™')."""
+    if not s:
+        return s
+    for ch in ("™", "®", "©", "℠"):  # trademark / registered / copyright / SM
+        s = s.replace(ch, "")
+    trans = {
+        "’": "'", "‘": "'", "‛": "'",
+        "“": '"', "”": '"',
+        "–": "-", "—": "-", "‑": "-", "‒": "-",
+        " ": " ", " ": " ", " ": " ", " ": " ",
+    }
+    for a, b in trans.items():
+        s = s.replace(a, b)
+    return " ".join(s.split()).strip()
+
+
 def pick_col(fieldnames, candidates):
     lower = {f.lower(): f for f in fieldnames}
     for c in candidates:
@@ -201,8 +220,8 @@ def process_lead(idx, full_name, article_url, linkedin, email, limiter, timeout)
     except json.JSONDecodeError as exc:
         return (idx, "failed", email, f"bad_json: {exc}", "", "")
 
-    topic = (data.get("topic") or "").strip()
-    first_name = (data.get("first_name") or "").strip()
+    topic = clean_text((data.get("topic") or "").strip())
+    first_name = clean_text((data.get("first_name") or "").strip())
     if topic in ("", "INSUFFICIENT", "FETCH_FAILED"):
         return (idx, "review", email, topic or "INSUFFICIENT", first_name, topic or "INSUFFICIENT")
     return (idx, "ok", email, "", first_name, topic)
@@ -294,6 +313,8 @@ def main():
     for idx, row in enumerate(rows):
         row.setdefault(fn_col, row.get(fn_col, ""))
         row.setdefault(tp_col, row.get(tp_col, ""))
+        if row.get(tp_col):
+            row[tp_col] = clean_text(row[tp_col])  # scrub any pre-existing dirty topics
         tp = (row.get(tp_col) or "").strip()
         if retry_mode == "all":
             done = False
