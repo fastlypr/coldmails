@@ -34,8 +34,8 @@ Env (optional; NVIDIA_* loaded from .env automatically):
   RETRY        re-do leads that weren't personalized. Unset = only empty/failed
                leads are retried on a re-run (default). "failed" = also redo
                INSUFFICIENT/FETCH_FAILED. "all" = redo every lead from scratch.
-  RPM          max model requests per minute (default 38)
-  CONCURRENCY  worker threads (default 8)
+  RPM          max model requests per minute (default 40)
+  CONCURRENCY  worker threads / leads processed at once (default 5)
   LIMIT        process only the first N pending leads (0 = all; for testing)
   CHECKPOINT   flush the CSV every N finished leads (default 20)
   REVIEW_LOG / FAILED_LOG  log paths (default review.log / failed.log)
@@ -238,8 +238,8 @@ def main():
         sys.stderr.write('usage: run_all.py "<leads.csv | google-sheet-url>"   (or set IN in .env)\n')
         return 64
 
-    rpm = float(os.environ.get("RPM", "38"))
-    concurrency = int(os.environ.get("CONCURRENCY", "8"))
+    rpm = float(os.environ.get("RPM", "40"))
+    concurrency = int(os.environ.get("CONCURRENCY", "5"))
     limit = int(os.environ.get("LIMIT", "0"))
     checkpoint_every = int(os.environ.get("CHECKPOINT", "20"))
     review_log = os.environ.get("REVIEW_LOG", "review.log")
