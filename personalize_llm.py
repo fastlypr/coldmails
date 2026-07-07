@@ -34,6 +34,8 @@ Environment:
   LLM_TIMEOUT      default 600   (seconds)
   LLM_REASONING_EFFORT  gpt-oss only: low|medium|high   (default high)
   LLM_EXTRA_BODY        advanced: raw JSON that overrides the per-model params
+  LLM_MAX_RETRIES  retries on transient errors (rate/capacity); default 4
+  LLM_RETRY_BACKOFF  base seconds for exponential backoff; default 2
   DEBUG_REASONING  if "1", stream the model's thinking to STDERR
 
 Exit codes:
@@ -45,7 +47,9 @@ Exit codes:
 import argparse
 import json
 import os
+import random
 import sys
+import time
 
 
 def die(msg, code=1):
@@ -135,41 +139,62 @@ def main():
         except json.JSONDecodeError:
             die("LLM_EXTRA_BODY is not valid JSON.", 2)
 
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
-            ],
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-            extra_body=extra_body,
-            stream=True,
-        )
-    except Exception as exc:  # noqa: BLE001 — surface any API/client error cleanly
-        die(f"NVIDIA API request failed: {exc}", 1)
+    max_retries = env_int("LLM_MAX_RETRIES", 4)
+    base_backoff = env_float("LLM_RETRY_BACKOFF", 2.0)
+    # Transient conditions worth retrying (shared-tier capacity, rate limits, blips).
+    transient = ("resourceexhausted", "request limit", "rate limit", "ratelimit",
+                 "429", "too many requests", "503", "overloaded", "capacity",
+                 "timeout", "temporarily", "unavailable")
 
-    answer_parts = []
-    try:
-        for chunk in completion:
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            reasoning = getattr(delta, "reasoning_content", None)
-            if reasoning and debug_reasoning:
-                sys.stderr.write(reasoning)
-                sys.stderr.flush()
-            content = getattr(delta, "content", None)
-            if content:
-                answer_parts.append(content)
-    except Exception as exc:  # noqa: BLE001
-        die(f"NVIDIA API stream error: {exc}", 1)
+    answer = ""
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=temperature,
+                top_p=top_p,
+                max_tokens=max_tokens,
+                extra_body=extra_body,
+                stream=True,
+            )
+            parts = []
+            for chunk in completion:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning and debug_reasoning:
+                    sys.stderr.write(reasoning)
+                    sys.stderr.flush()
+                content = getattr(delta, "content", None)
+                if content:
+                    parts.append(content)
+            answer = "".join(parts).strip()
+            if answer:
+                break
+            last_err = "empty completion (no content)"
+            retryable = True
+        except Exception as exc:  # noqa: BLE001 — surface/inspect any API/client error
+            last_err = str(exc)
+            retryable = any(m in last_err.lower() for m in transient)
 
-    answer = "".join(answer_parts).strip()
+        if attempt < max_retries and retryable:
+            wait = min(base_backoff * (2 ** attempt), 15.0) + random.uniform(0, 1)
+            sys.stderr.write(
+                f"personalize_llm: transient error (attempt {attempt + 1}/{max_retries}), "
+                f"retrying in {wait:.1f}s: {last_err[:120]}\n"
+            )
+            time.sleep(wait)
+            continue
+        die(f"NVIDIA API error after {attempt + 1} attempt(s): {last_err}", 1)
+
     if not answer:
-        die("model returned an empty completion (no content).", 1)
+        die(f"model returned no content: {last_err}", 1)
 
     # STDOUT must be just the model reply; personalize.sh extracts the JSON object.
     sys.stdout.write(answer)
