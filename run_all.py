@@ -29,8 +29,11 @@ Usage:
   python3 run_all.py "https://docs.google.com/spreadsheets/d/<ID>/edit#gid=0"
 
 Env (optional; NVIDIA_* loaded from .env automatically):
-  OUT          target CSV for the Google-Sheet case (default gsheet_leads.csv).
-               For a local CSV this is ignored — it always writes in place.
+  OUT          output CSV. Google Sheet -> default gsheet_leads.csv; local CSV ->
+               writes in place unless OUT is set (e.g. results/x.csv).
+  RETRY        re-do leads that weren't personalized. Unset = only empty/failed
+               leads are retried on a re-run (default). "failed" = also redo
+               INSUFFICIENT/FETCH_FAILED. "all" = redo every lead from scratch.
   RPM          max model requests per minute (default 38)
   CONCURRENCY  worker threads (default 8)
   LIMIT        process only the first N pending leads (0 = all; for testing)
@@ -280,13 +283,25 @@ def main():
             if e in prior and prior[e][1].strip() and not (row.get(tp_col) or "").strip():
                 row[fn_col], row[tp_col] = prior[e]
 
-    # Ensure every row has the two keys, and build the to-do list (empty topic).
+    # RETRY relaxes what counts as "done": default keeps any non-empty topic (so
+    # only empty/failed leads are retried on re-run); "failed" also redoes
+    # INSUFFICIENT/FETCH_FAILED; "all" redoes every lead.
+    retry_mode = os.environ.get("RETRY", "").strip().lower()
+
+    # Ensure every row has the two keys, and build the to-do list.
     todo = []
     already = 0
     for idx, row in enumerate(rows):
         row.setdefault(fn_col, row.get(fn_col, ""))
         row.setdefault(tp_col, row.get(tp_col, ""))
-        if (row.get(tp_col) or "").strip():
+        tp = (row.get(tp_col) or "").strip()
+        if retry_mode == "all":
+            done = False
+        elif retry_mode in ("1", "yes", "true", "failed"):
+            done = bool(tp) and tp not in ("INSUFFICIENT", "FETCH_FAILED")
+        else:
+            done = bool(tp)
+        if done:
             already += 1
             continue
         if limit and len(todo) >= limit:
