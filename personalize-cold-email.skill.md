@@ -134,6 +134,8 @@ Skipping beats shipping a generic line that screams "mass blast."
   {industry}", "your success", "your expertise", "the future of {industry}",
   "all things {X}".
 - State the thing plainly. Specificity is the flattery.
+- **Plain text only:** ASCII only — no `™`/`®`/`©` symbols, emojis, or curly
+  quotes. If the article writes a name with a symbol (e.g. `Sites™`), drop it → `Sites`.
 
 ### Proof gate — run this before committing
 

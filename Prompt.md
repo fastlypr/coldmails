@@ -89,6 +89,8 @@ A specific advocacy position, professional angle, or reframing the subject is pu
 
 TOPIC LENGTH: 4-10 words maximum. Keep it tight and specific.
 
+PLAIN TEXT ONLY: Output plain ASCII — no ™, ®, © symbols, emojis, or curly quotes. If the article writes a brand/product name with a symbol (e.g. "Sites™"), drop the symbol ("Sites").
+
 ### RULES FOR ROLE
 
 Single role title, 1-3 words. Examples: founder, CEO, investor, coach, strategic advisor, wealth manager, consultant, author, doctor, surgeon, researcher, physician, anesthesiologist. Pull from how the article describes the subject matching the provided full_name.
