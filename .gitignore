@@ -12,6 +12,7 @@ leads_personalized.csv
 gsheet*.csv
 test_*.csv
 USA TODAY*.csv
+results/
 
 # Secrets / environment (Notion token is entered at runtime, never commit it)
 .env
