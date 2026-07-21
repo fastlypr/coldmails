@@ -73,33 +73,29 @@ def one_model(article_content, full_name, article_url, linkedin, email, model, t
         clean_text((data.get("topic") or "").strip())
 
 
-def process_lead(idx, full_name, article_url, linkedin, email, models, limiter, timeout):
-    aliases = [alias(m) for m in models]
-    topics = {a: "" for a in aliases}
-    first_name = ""
-
-    if not article_url:
-        return (idx, "no_article_url", first_name, topics)
-
+def fetch_one(url, timeout):
+    """Fetch + clean an article once; returns text or None on failure."""
+    if not url:
+        return None
     try:
-        fetch = subprocess.run(
-            [PY, os.path.join(SCRIPT_DIR, "fetch_article.py"), article_url],
+        r = subprocess.run(
+            [PY, os.path.join(SCRIPT_DIR, "fetch_article.py"), url],
             capture_output=True, text=True, timeout=timeout,
         )
     except subprocess.TimeoutExpired:
-        return (idx, "FETCH_FAILED", first_name, topics)
-    if fetch.returncode != 0 or len(fetch.stdout.strip()) < 1:
-        return (idx, "FETCH_FAILED", first_name, topics)
-    article = fetch.stdout
+        return None
+    if r.returncode != 0 or len(r.stdout.strip()) < 1:
+        return None
+    return r.stdout
 
-    # Ask each model (each call is rate-limited against the shared RPM cap).
-    for model in models:
-        limiter.wait()
-        fn, tp = one_model(article, full_name, article_url, linkedin, email, model, timeout)
-        topics[alias(model)] = tp
-        if fn and not first_name:
-            first_name = fn
-    return (idx, "ok", first_name, topics)
+
+def run_model(article, t, model, limiter, timeout):
+    """Ask one model for a topic on one lead (article already fetched)."""
+    _idx, full_name, url, linkedin, email = t
+    if not article:
+        return ("", "")
+    limiter.wait()
+    return one_model(article, full_name, url, linkedin, email, model, timeout)
 
 
 def main():
@@ -190,25 +186,37 @@ def main():
     limiter = RateLimiter(rpm)
     lock = threading.Lock()
     started = time.monotonic()
-    n_done = 0
 
+    # Phase 1 — fetch each article ONCE, shared across all models.
+    print("Fetching articles...")
+    articles = {}
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        futures = [pool.submit(process_lead, *t, models, limiter, timeout) for t in todo]
-        for fut in as_completed(futures):
-            idx, status, first_name, topics = fut.result()
-            with lock:
-                n_done += 1
-                if first_name:
-                    rows[idx][fn_col] = first_name
-                for a in aliases:
-                    rows[idx][f"topic__{a}"] = topics.get(a, "")
-                shown = "  |  ".join(f"{a}: {topics.get(a, '') or status}" for a in aliases)
-                print(f"[{n_done}/{total}] {rows[idx].get(email_col, '')}")
-                print(f"     {shown}")
-                if n_done % 10 == 0:
-                    write_atomic(out_path, out_fields, rows)
+        futs = {pool.submit(fetch_one, t[2], timeout): t[0] for t in todo}
+        for fut in as_completed(futs):
+            articles[futs[fut]] = fut.result()
+    print(f"  fetched {sum(1 for v in articles.values() if v)}/{total} (rest failed to fetch)")
 
-    write_atomic(out_path, out_fields, rows)
+    # Phase 2 — one model at a time over all leads; SAVE the CSV after each model.
+    for model in models:
+        a = alias(model)
+        print("-" * 60)
+        print(f"Model: {model}  (filling topic__{a})")
+        n = 0
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            futs = {pool.submit(run_model, articles.get(t[0]), t, model, limiter, timeout): t
+                    for t in todo}
+            for fut in as_completed(futs):
+                t = futs[fut]
+                fn, tp = fut.result()
+                with lock:
+                    n += 1
+                    rows[t[0]][f"topic__{a}"] = tp
+                    if fn and not (rows[t[0]].get(fn_col) or "").strip():
+                        rows[t[0]][fn_col] = fn
+                    print(f"  [{n}/{total}] {rows[t[0]].get(email_col, '')} -> {tp or 'FAIL'}")
+        write_atomic(out_path, out_fields, rows)   # save this model's column before the next model
+        print(f"  saved topic__{a} -> {out_path}")
+
     elapsed = time.monotonic() - started
     print("-" * 60)
     print(f"Done in {elapsed/60:.1f} min. Compare the topic__ columns in: {out_path}")
